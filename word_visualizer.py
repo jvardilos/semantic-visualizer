@@ -1,19 +1,20 @@
 """
 3D Semantic Word Space Visualizer
 ----------------------------------
-Pick two words. See them plotted in reduced 3D embedding space with their
-nearest neighbours fanned out around them. A line connects the two anchor
-words and is labelled with their cosine similarity.
+Pick three words. See them plotted in reduced 3D embedding space with their
+nearest neighbours fanned out around them. Lines connect each pair of anchors
+labelled with their pairwise cosine similarities.
 
-Renders as an interactive HTML page in your browser — no X11 or Qt needed.
+Renders as an interactive HTML page — open the saved file in your Windows browser.
 
 First run downloads GloVe embeddings (~66 MB, cached to ~/gensim-data/).
 Usage:
     python word_visualizer.py
-    python word_visualizer.py king queen      # pass words as args
+    python word_visualizer.py king queen man     # pass words as args
 """
 
 import sys
+from itertools import combinations
 import numpy as np
 import plotly.graph_objects as go
 from sklearn.decomposition import PCA
@@ -23,19 +24,13 @@ from relations import cosine_similarity
 
 
 # ── configuration ──────────────────────────────────────────────────────────────
-MODEL_NAME = "glove-wiki-gigaword-50"   # ~66 MB; swap -100/-200/-300 for higher quality
-N_NEIGHBORS = 8                          # similar words shown around each anchor
+MODEL_NAME  = "glove-wiki-gigaword-50"
+N_NEIGHBORS = 8
 
-
-# ── colour palette ─────────────────────────────────────────────────────────────
-C_WORD1  = "#2563EB"   # blue        – anchor 1
-C_WORD2  = "#DC2626"   # red         – anchor 2
-C_NB1    = "#93C5FD"   # light blue  – neighbours of word 1 only
-C_NB2    = "#FCA5A5"   # light red   – neighbours of word 2 only
-C_SHARED = "#7C3AED"   # purple      – shared neighbours
-C_EDGE1  = "#3B82F6"   # spoke from anchor 1
-C_EDGE2  = "#EF4444"   # spoke from anchor 2
-C_BRIDGE = "#111827"   # line between anchors
+# anchor colours (one per word)
+ANCHOR_COLORS = ["#2563EB", "#DC2626", "#16A34A"]   # blue, red, green
+NB_COLORS     = ["#93C5FD", "#FCA5A5", "#86EFAC"]   # light blue/red/green
+SHARED_COLOR  = "#7C3AED"                            # purple – shared by 2+ anchors
 
 
 def load_model():
@@ -43,11 +38,19 @@ def load_model():
     return api.load(MODEL_NAME)
 
 
-def build_word_set(model, word1: str, word2: str, n: int):
-    nb1 = [w for w, _ in model.most_similar(word1, topn=n)]
-    nb2 = [w for w, _ in model.most_similar(word2, topn=n)]
+def build_word_set(model, anchors: list[str], n: int):
+    """
+    Returns:
+        unique  – ordered word list (anchors first)
+        vectors – corresponding embedding matrix
+        nb_sets – list of sets, one per anchor, containing that anchor's neighbours
+    """
+    nb_sets = [[w for w, _ in model.most_similar(a, topn=n)] for a in anchors]
 
-    all_words = [word1, word2] + nb1 + nb2
+    all_words = list(anchors)
+    for nbs in nb_sets:
+        all_words += nbs
+
     seen, unique = set(), []
     for w in all_words:
         if w not in seen:
@@ -55,7 +58,7 @@ def build_word_set(model, word1: str, word2: str, n: int):
             unique.append(w)
 
     vectors = np.array([model[w] for w in unique])
-    return unique, vectors, set(nb1), set(nb2)
+    return unique, vectors, [set(nbs) for nbs in nb_sets]
 
 
 def reduce_3d(vectors: np.ndarray):
@@ -64,112 +67,116 @@ def reduce_3d(vectors: np.ndarray):
     return coords, pca.explained_variance_ratio_
 
 
-def classify(word, word1, word2, nb1_set, nb2_set):
-    if word == word1:   return "anchor1"
-    if word == word2:   return "anchor2"
-    in1, in2 = word in nb1_set, word in nb2_set
-    if in1 and in2:     return "shared"
-    if in1:             return "nb1"
-    return "nb2"
-
-
-def build_figure(word1, word2, unique, coords, nb1_set, nb2_set, sim, variance):
-    idx1 = unique.index(word1)
-    idx2 = unique.index(word2)
-    p1, p2 = coords[idx1], coords[idx2]
-
+def build_figure(anchors, unique, coords, nb_sets, sims, variance):
+    n_anchors = len(anchors)
     traces = []
 
-    # ── spokes: neighbours → anchors ───────────────────────────────────────────
+    anchor_idx = [unique.index(a) for a in anchors]
+    anchor_pts  = [coords[i] for i in anchor_idx]
+
+    # ── spokes: each neighbour → its anchor(s) ────────────────────────────────
     for i, word in enumerate(unique):
-        kind = classify(word, word1, word2, nb1_set, nb2_set)
-        if kind in ("nb1", "shared"):
-            x0, y0, z0 = p1
-            x1, y1, z1 = coords[i]
-            traces.append(go.Scatter3d(
-                x=[x0, x1, None], y=[y0, y1, None], z=[z0, z1, None],
-                mode="lines",
-                line=dict(color=C_EDGE1, width=1),
-                opacity=0.3,
-                showlegend=False,
-                hoverinfo="skip",
-            ))
-        if kind in ("nb2", "shared"):
-            x0, y0, z0 = p2
-            x1, y1, z1 = coords[i]
-            traces.append(go.Scatter3d(
-                x=[x0, x1, None], y=[y0, y1, None], z=[z0, z1, None],
-                mode="lines",
-                line=dict(color=C_EDGE2, width=1),
-                opacity=0.3,
-                showlegend=False,
-                hoverinfo="skip",
-            ))
-
-    # ── bridge line between the two anchors ────────────────────────────────────
-    traces.append(go.Scatter3d(
-        x=[p1[0], p2[0]], y=[p1[1], p2[1]], z=[p1[2], p2[2]],
-        mode="lines+text",
-        line=dict(color=C_BRIDGE, width=4),
-        text=["", f"cos sim = {sim:.3f}"],
-        textposition="middle center",
-        textfont=dict(size=13, color=C_BRIDGE),
-        name=f"similarity = {sim:.4f}",
-        hoverinfo="name",
-    ))
-
-    # ── scatter groups ─────────────────────────────────────────────────────────
-    groups = {
-        "anchor1": dict(color=C_WORD1,  size=18, symbol="diamond", label=f'"{word1}" (anchor)'),
-        "anchor2": dict(color=C_WORD2,  size=18, symbol="diamond", label=f'"{word2}" (anchor)'),
-        "nb1":     dict(color=C_NB1,    size=9,  symbol="circle",  label=f'Neighbours of "{word1}"'),
-        "nb2":     dict(color=C_NB2,    size=9,  symbol="circle",  label=f'Neighbours of "{word2}"'),
-        "shared":  dict(color=C_SHARED, size=11, symbol="square",  label="Shared neighbours"),
-    }
-
-    bucket: dict[str, dict] = {k: {"x": [], "y": [], "z": [], "text": [], "hover": []}
-                                for k in groups}
-
-    for i, word in enumerate(unique):
-        kind = classify(word, word1, word2, nb1_set, nb2_set)
-        x, y, z = coords[i]
-        nb_sims = cosine_similarity(np.array([model[word]]), np.array([[model[word1][0]]]))[0] \
-            if False else None  # hover text built below
-        bucket[kind]["x"].append(x)
-        bucket[kind]["y"].append(y)
-        bucket[kind]["z"].append(z)
-        bucket[kind]["text"].append(word)
-
-    for kind, grp in groups.items():
-        b = bucket[kind]
-        if not b["x"]:
+        if word in anchors:
             continue
+        for ai, (a, nb_set, color) in enumerate(zip(anchors, nb_sets, ANCHOR_COLORS)):
+            if word in nb_set:
+                p0 = anchor_pts[ai]
+                p1 = coords[i]
+                traces.append(go.Scatter3d(
+                    x=[p0[0], p1[0], None],
+                    y=[p0[1], p1[1], None],
+                    z=[p0[2], p1[2], None],
+                    mode="lines",
+                    line=dict(color=color, width=1),
+                    opacity=0.25,
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+
+    # ── bridge lines between every pair of anchors ────────────────────────────
+    for (ai, aj), sim in zip(combinations(range(n_anchors), 2), sims):
+        p0, p1 = anchor_pts[ai], anchor_pts[aj]
+        mid = (np.array(p0) + np.array(p1)) / 2
+        label = f"{anchors[ai]} ↔ {anchors[aj]}: {sim:.3f}"
         traces.append(go.Scatter3d(
-            x=b["x"], y=b["y"], z=b["z"],
-            mode="markers+text",
-            marker=dict(
-                size=grp["size"],
-                color=grp["color"],
-                symbol=grp["symbol"],
-                line=dict(color="white", width=1),
-                opacity=0.9,
-            ),
-            text=b["text"],
-            textposition="top center",
-            textfont=dict(size=10 if kind.startswith("anchor") else 9,
-                          color="#1E293B"),
-            name=grp["label"],
-            hovertemplate="<b>%{text}</b><extra></extra>",
+            x=[p0[0], mid[0], p1[0]],
+            y=[p0[1], mid[1], p1[1]],
+            z=[p0[2], mid[2], p1[2]],
+            mode="lines+text",
+            line=dict(color="#111827", width=3),
+            text=["", f"cos={sim:.3f}", ""],
+            textposition="middle center",
+            textfont=dict(size=11, color="#111827"),
+            name=label,
+            hoverinfo="name",
         ))
 
-    # ── layout ─────────────────────────────────────────────────────────────────
+    # ── scatter: anchors ──────────────────────────────────────────────────────
+    for ai, (a, color) in enumerate(zip(anchors, ANCHOR_COLORS)):
+        p = anchor_pts[ai]
+        traces.append(go.Scatter3d(
+            x=[p[0]], y=[p[1]], z=[p[2]],
+            mode="markers+text",
+            marker=dict(size=18, color=color, symbol="diamond",
+                        line=dict(color="white", width=1.5), opacity=1.0),
+            text=[a],
+            textposition="top center",
+            textfont=dict(size=13, color="#1E293B"),
+            name=f'"{a}" (anchor)',
+            hovertemplate=f"<b>{a}</b><extra></extra>",
+        ))
+
+    # ── scatter: neighbours, bucketed by membership ───────────────────────────
+    # Each non-anchor word gets a colour based on which anchors claim it.
+    # Shared by 2+  → purple.  Exclusive → that anchor's light colour.
+    for i, word in enumerate(unique):
+        if word in anchors:
+            continue
+        membership = [ai for ai, nb_set in enumerate(nb_sets) if word in nb_set]
+        if len(membership) > 1:
+            color = SHARED_COLOR
+            size  = 11
+            group = "Shared neighbours"
+        else:
+            ai    = membership[0]
+            color = NB_COLORS[ai]
+            size  = 9
+            group = f'Neighbours of "{anchors[ai]}"'
+
+        p = coords[i]
+        traces.append(go.Scatter3d(
+            x=[p[0]], y=[p[1]], z=[p[2]],
+            mode="markers+text",
+            marker=dict(size=size, color=color, symbol="circle",
+                        line=dict(color="white", width=0.8), opacity=0.88),
+            text=[word],
+            textposition="top center",
+            textfont=dict(size=9, color="#1E293B"),
+            name=group,
+            legendgroup=group,
+            showlegend=(word == next(
+                w for w in unique
+                if w not in anchors and (
+                    (len(membership) > 1 and SHARED_COLOR == color) or
+                    (len(membership) == 1 and membership[0] == ai)
+                )
+            )),
+            hovertemplate=f"<b>{word}</b><extra></extra>",
+        ))
+
+    # ── layout ────────────────────────────────────────────────────────────────
+    pair_sims = " · ".join(
+        f"{anchors[ai]}↔{anchors[aj]}={s:.3f}"
+        for (ai, aj), s in zip(combinations(range(n_anchors), 2), sims)
+    )
     layout = go.Layout(
         title=dict(
-            text=(f'Semantic Space · "<b>{word1}</b>" ↔ "<b>{word2}</b>"'
-                  f'<br><sup>Cosine Similarity = {sim:.4f} · {MODEL_NAME}'
-                  f' · PC variance: {variance[0]:.1%} / {variance[1]:.1%} / {variance[2]:.1%}</sup>'),
+            text=(f'Semantic Space · '
+                  + " · ".join(f"<b>{a}</b>" for a in anchors)
+                  + f'<br><sup>{pair_sims} · {MODEL_NAME}'
+                  f' · PC variance: {variance[0]:.1%}/{variance[1]:.1%}/{variance[2]:.1%}</sup>'),
             x=0.5,
-            font=dict(size=16),
+            font=dict(size=15),
         ),
         scene=dict(
             xaxis=dict(title=f"PC1 ({variance[0]:.1%})", backgroundcolor="#F1F5F9",
@@ -182,51 +189,52 @@ def build_figure(word1, word2, unique, coords, nb1_set, nb2_set, sim, variance):
         paper_bgcolor="#F8FAFC",
         legend=dict(
             x=0.01, y=0.99,
-            bgcolor="rgba(255,255,255,0.7)",
+            bgcolor="rgba(255,255,255,0.75)",
             bordercolor="#CBD5E1",
             borderwidth=1,
+            itemsizing="constant",
         ),
-        margin=dict(l=0, r=0, t=80, b=0),
+        margin=dict(l=0, r=0, t=90, b=0),
     )
 
     return go.Figure(data=traces, layout=layout)
 
 
 def main():
-    global model
     model = load_model()
 
-    if len(sys.argv) >= 3:
-        word1, word2 = sys.argv[1].lower(), sys.argv[2].lower()
+    if len(sys.argv) >= 4:
+        anchors = [w.lower() for w in sys.argv[1:4]]
     else:
-        word1 = input("First word : ").strip().lower()
-        word2 = input("Second word: ").strip().lower()
+        anchors = [input(f"Word {i+1}: ").strip().lower() for i in range(3)]
 
-    for w in (word1, word2):
+    for w in anchors:
         if w not in model:
-            print(f"  '{w}' not found in vocabulary. Try a simpler / more common word.")
+            print(f"  '{w}' not found in vocabulary.")
             sys.exit(1)
 
-    print(f"Building neighbourhood for '{word1}' and '{word2}'…")
-    unique, vectors, nb1_set, nb2_set = build_word_set(model, word1, word2, N_NEIGHBORS)
-
+    print(f"Building neighbourhoods for {anchors}…")
+    unique, vectors, nb_sets = build_word_set(model, anchors, N_NEIGHBORS)
     coords, variance = reduce_3d(vectors)
 
-    v1, v2 = model[word1], model[word2]
-    sim = cosine_similarity(v1, v2)[0]
+    # pairwise cosine similarities
+    sims = [
+        cosine_similarity(model[anchors[ai]], model[anchors[aj]])[0]
+        for ai, aj in combinations(range(len(anchors)), 2)
+    ]
+    for (ai, aj), s in zip(combinations(range(len(anchors)), 2), sims):
+        print(f"  {anchors[ai]} ↔ {anchors[aj]}: {s:.4f}")
 
-    print(f"Cosine similarity: {sim:.4f}")
-    shared = nb1_set & nb2_set
+    shared = set.intersection(*nb_sets)
     if shared:
-        print(f"Shared neighbours: {', '.join(shared)}")
+        print(f"  Shared by all three: {', '.join(shared)}")
 
-    fig = build_figure(word1, word2, unique, coords, nb1_set, nb2_set, sim, variance)
+    fig = build_figure(anchors, unique, coords, nb_sets, sims, variance)
 
-    out = f"semantic_{word1}_{word2}.html"
+    out = f"semantic_{'_'.join(anchors)}.html"
     fig.write_html(out, include_plotlyjs="cdn")
-    print(f"\nPlot saved → {out}")
-    print(f"Open in browser: file:///$(wslpath -w $(realpath {out}))")
-
+    print(f"\nSaved → {out}")
+    print(f"Windows path: \\\\wsl.localhost\\Ubuntu{out.replace('/', chr(92)) if out.startswith('/') else '\\\\wsl.localhost\\Ubuntu\\home\\jvardi\\research\\bm25\\' + out}")
 
 if __name__ == "__main__":
     main()
